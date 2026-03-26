@@ -459,7 +459,6 @@
   .col-copy-btn.copied { border-color: var(--green); color: var(--green); background: var(--green-dim); }
   tbody tr { border-bottom: 1px solid var(--border); transition: background 0.1s; }
   tbody tr:hover { background: var(--row-hover); }
-  tbody tr.edited-row { background: var(--edited); }
   tbody td {
     padding: 8px 14px;
     border-right: 1px solid var(--border);
@@ -469,20 +468,20 @@
   }
   tbody td:last-child { border-right: none; }
   .cell-text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
-  td.editable { cursor: pointer; position: relative; }
-  td.editable:hover .cell-text { color: var(--accent); }
-  td.editable:hover::after {
-    content: '✎';
-    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
-    font-size: 10px; color: var(--text-muted); opacity: 0.6;
+  /* checkbox column */
+  th.col-check, td.col-check {
+    width: 32px; min-width: 32px; max-width: 32px;
+    text-align: center; padding: 0 6px;
   }
-  td.editing { padding: 4px 8px; }
-  td.editing input {
-    width: 100%; background: #1a1f2e; border: 1.5px solid var(--accent);
-    color: var(--text); padding: 4px 8px; border-radius: 5px;
-    font-size: 12.5px; font-family: 'IBM Plex Sans', sans-serif; outline: none;
+  .row-check {
+    width: 14px; height: 14px; cursor: pointer;
+    accent-color: var(--green);
   }
-  .date-pill {
+  tr.row-highlighted td {
+    background: rgba(52, 211, 153, 0.12) !important;
+  }
+  tr.row-highlighted { border-left: 3px solid var(--green); }
+    .date-pill {
     display: inline-flex; align-items: center; gap: 5px;
     font-family: 'IBM Plex Mono', monospace; font-size: 11px;
     background: rgba(79,142,247,0.08); border: 1px solid rgba(79,142,247,0.18);
@@ -705,17 +704,17 @@
 <script>
 // ── CONFIG ──
 const KEEP_COLS = ['OWNER_CODE','WORKFLOW_CODE','BOL_NUMBER','ITEM_CODE','ITEM_DESCRIPTION','CURRENT_CONDITION_CODE','MSN','QUANTITY','DATE_STOCK_ENTRY'];
-const EDITABLE_COLS = new Set(['OWNER_CODE','WORKFLOW_CODE','BOL_NUMBER','ITEM_CODE','ITEM_DESCRIPTION','CURRENT_CONDITION_CODE','MSN','QUANTITY','DATE_STOCK_ENTRY']);
+
 const PRETTY = { OWNER_CODE:'Owner Code', WORKFLOW_CODE:'Workflow', BOL_NUMBER:'BOL Number', ITEM_CODE:'Item Code', ITEM_DESCRIPTION:'Item Description', CURRENT_CONDITION_CODE:'Condition', MSN:'MSN', QUANTITY:'Qty', DATE_STOCK_ENTRY:'Date Stock Entry' };
 const WAREHOUSES = ['cov','deu','osh'];
 
 // ── STATE ──
 const warehouseData = { cov: null, deu: null, osh: null };  // null = not loaded, [] = loaded rows
-const warehouseEdits = { cov: {}, deu: {}, osh: {} };
 let activeTab = null;
 let showCondition = true;
 let selectedMSN = new Set();
 let msnCommas = new Set();
+let checkedRows = { cov: new Set(), deu: new Set(), osh: new Set() };
 let isDragging = false;
 let dragSelecting = true;
 
@@ -743,7 +742,6 @@ function handleUpload(wh, file) {
       for (const k in row) norm[k.toUpperCase()] = row[k];
       return norm;
     });
-    warehouseEdits[wh] = {};
     updateCardUI(wh, file.name);
     updateProceedBtn();
   };
@@ -764,7 +762,6 @@ function updateCardUI(wh, filename) {
 function removeWarehouse(e, wh) {
   e.stopPropagation();
   warehouseData[wh] = null;
-  warehouseEdits[wh] = {};
   const card = document.getElementById('card-'+wh);
   const status = document.getElementById('status-'+wh);
   const fname = document.getElementById('fname-'+wh);
@@ -849,7 +846,6 @@ function populateSelect(id, rows, col) {
 function applyFilters() {
   if (!activeTab || !warehouseData[activeTab]) return;
   const rows = warehouseData[activeTab];
-  const edits = warehouseEdits[activeTab];
   const owner = document.getElementById('filter-owner').value;
   const workflow = document.getElementById('filter-workflow').value;
 
@@ -870,13 +866,11 @@ function applyFilters() {
 
 function getCellVal(row, rowIdx, col) {
   col = col || 'DATE_STOCK_ENTRY';
-  const e = warehouseEdits[activeTab];
-  return (e[rowIdx] && e[rowIdx][col] !== undefined) ? e[rowIdx][col] : row[col];
+  return row[col];
 }
 
 function getCellValFull(row, rowIdx, col) {
-  const e = warehouseEdits[activeTab];
-  return (e[rowIdx] && e[rowIdx][col] !== undefined) ? e[rowIdx][col] : row[col];
+  return row[col];
 }
 
 function parseDate(val) {
@@ -888,23 +882,24 @@ function parseDate(val) {
 // ── RENDER ──
 function renderTable(filteredRows) {
   const visibleCols = KEEP_COLS.filter(c => c !== 'CURRENT_CONDITION_CODE' || showCondition);
-  const edits = warehouseEdits[activeTab];
+  const checked = checkedRows[activeTab];
 
   const head = document.getElementById('table-head');
-  head.innerHTML = '<tr>' + visibleCols.map(col => {
+  head.innerHTML = '<tr><th class="col-check"></th>' + visibleCols.map(col => {
     const isDate = col === 'DATE_STOCK_ENTRY';
     return `<th class="${isDate?'col-date':''}">${PRETTY[col]}${isDate?' <span class="sort-icon">↓</span>':''}<button class="col-copy-btn" onclick="copyColumn(event,'${col}')">copy</button></th>`;
   }).join('') + '</tr>';
 
   const tbody = document.getElementById('table-body');
   if (filteredRows.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="${visibleCols.length}"><div class="empty-state"><div class="empty-icon">🔍</div><p>No rows match filters.</p></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="${visibleCols.length + 1}"><div class="empty-state"><div class="empty-icon">🔍</div><p>No rows match filters.</p></div></td></tr>`;
     return;
   }
 
   tbody.innerHTML = filteredRows.map(({row, idx}) => {
-    const hasEdit = !!edits[idx];
     const isSel = selectedMSN.has(idx);
+    const isChecked = checked.has(idx);
+    const checkCell = `<td class="col-check"><input type="checkbox" class="row-check" data-row="${idx}" ${isChecked?'checked':''} onchange="toggleRowCheck(${idx}, this.checked)"></td>`;
     const cells = visibleCols.map(col => {
       if (col === 'MSN') {
         const rawMSN = getCellValFull(row, idx, col);
@@ -914,11 +909,11 @@ function renderTable(filteredRows) {
       }
       const rawVal = getCellValFull(row, idx, col);
       const display = formatCell(col, rawVal);
-      const isEdit = EDITABLE_COLS.has(col);
-      return `<td class="${isEdit?'editable':''}" data-row="${idx}" data-col="${col}" onclick="${isEdit?`startEdit(this,${idx},'${col}')`:''}""><span class="cell-text">${display}</span></td>`;
+      return `<td data-row="${idx}" data-col="${col}"><span class="cell-text">${display}</span></td>`;
     }).join('');
     const selClass = isSel ? 'msn-selected' : '';
-    return `<tr class="${hasEdit?'edited-row':''} ${selClass}" data-row="${idx}">${cells}</tr>`;
+    const checkedClass = isChecked ? 'row-highlighted' : '';
+    return `<tr class="${selClass} ${checkedClass}" data-row="${idx}">${checkCell}${cells}</tr>`;
   }).join('');
 }
 
@@ -937,27 +932,13 @@ function formatCell(col, val) {
   return `<span title="${esc(String(val))}">${esc(String(val))}</span>`;
 }
 
-// ── INLINE EDIT ──
-function startEdit(td, rowIdx, col) {
-  if (td.classList.contains('editing')) return;
-  const rows = warehouseData[activeTab];
-  const e = warehouseEdits[activeTab];
-  const currentVal = (e[rowIdx]&&e[rowIdx][col]!==undefined) ? e[rowIdx][col] : rows[rowIdx][col];
-  const displayVal = currentVal instanceof Date ? currentVal.toISOString().slice(0,10) : String(currentVal??'');
-  td.classList.add('editing');
-  td.innerHTML = `<input type="text" value="${esc(displayVal)}" onblur="commitEdit(this,${rowIdx},'${col}')" onkeydown="handleEditKey(event,this,${rowIdx},'${col}')" autofocus>`;
-  td.querySelector('input').focus();
-}
-function commitEdit(input, rowIdx, col) {
-  const e = warehouseEdits[activeTab];
-  if (!e[rowIdx]) e[rowIdx] = {};
-  e[rowIdx][col] = input.value;
-  applyFilters();
-  showToast('Cell updated');
-}
-function handleEditKey(e, input, rowIdx, col) {
-  if (e.key === 'Enter') input.blur();
-  if (e.key === 'Escape') applyFilters();
+// ── ROW HIGHLIGHT ──
+function toggleRowCheck(rowIdx, isChecked) {
+  const checked = checkedRows[activeTab];
+  if (isChecked) checked.add(rowIdx);
+  else checked.delete(rowIdx);
+  const tr = document.querySelector(`tr[data-row="${rowIdx}"]`);
+  if (tr) tr.classList.toggle('row-highlighted', isChecked);
 }
 
 // ── CONDITION TOGGLE ──

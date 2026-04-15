@@ -111,20 +111,31 @@
   </div>
 
   <div class="upload-bar">
-    <span class="upload-label">Update <strong id="activeWhName">Coventry UK</strong> data:</span>
-    <label class="upload-btn" for="csvInput">
-      &#8679; Upload CSV
-      <input type="file" id="csvInput" accept=".csv,text/csv" onchange="handleCsvUpload(event)">
+    <span class="upload-label">Update <strong id="activeWhName">Coventry UK</strong> data &mdash; load both files to match:</span>
+    <label class="upload-btn" for="wmsInput">
+      &#8679; WMS Stock Report
+      <input type="file" id="wmsInput" accept=".csv,text/csv" onchange="handleCsvUpload(event,'wms')">
     </label>
-    <button class="upload-btn secondary" onclick="resetWarehouseData()">Reset to original</button>
+    <label class="upload-btn" for="fbInput">
+      &#8679; Firstbase Orders
+      <input type="file" id="fbInput" accept=".csv,text/csv" onchange="handleCsvUpload(event,'fb')">
+    </label>
+    <button class="upload-btn secondary" onclick="resetWarehouseData()">Reset</button>
     <span class="upload-status" id="uploadStatus"></span>
     <details>
-      <summary>Expected CSV columns</summary>
-      <div class="hint">Required (case-insensitive, flexible names): po, organization, category, qty, wh_received (YYYY-MM-DD), fb_inbounded (YYYY-MM-DD)
-Optional: business_days, calendar_days (auto-computed from dates if missing)
+      <summary>Expected CSV columns (flexible, case-insensitive)</summary>
+      <div class="hint">WMS Stock Report — required: po, wh_received (or received_date); recommended: organization, category, qty
+Firstbase Orders  — required: po, fb_inbounded (or inbound_date)
 
-Example header row:
-po,organization,category,qty,wh_received,fb_inbounded,business_days,calendar_days</div>
+Matching: POs present in BOTH files are joined by PO number. Business days are computed from the two dates (weekends excluded), and the SLO target is ≤ 2 business days.
+
+Accepted aliases:
+  po:          po, po_number, po_num, purchase_order, order_number, order_id
+  organization: org, organization, customer, company, account
+  category:    category, product_category, type
+  qty:         qty, quantity, units, count
+  wh_received: wh_received, warehouse_received, received, received_at, received_date
+  fb_inbounded: fb_inbounded, firstbase_inbounded, inbounded, inbound_date, inbounded_at</div>
     </details>
   </div>
 
@@ -411,42 +422,86 @@ function businessDaysBetween(a,b){
   return days;
 }
 
-function buildWarehouseDataFromRows(rows){
-  if(!rows.length) throw new Error('CSV is empty');
-  const header=rows[0];
-  const colmap=buildColumnMap(header);
-  const required=['po','wh_received','fb_inbounded'];
-  const missing=required.filter(r=>!(r in colmap));
-  if(missing.length) throw new Error('Missing required columns: '+missing.join(', '));
-
-  const all_pos=[];
+function parseWmsRows(rows){
+  if(!rows.length) throw new Error('WMS CSV is empty');
+  const colmap=buildColumnMap(rows[0]);
+  const miss=['po','wh_received'].filter(k=>!(k in colmap));
+  if(miss.length) throw new Error('WMS file missing columns: '+miss.join(', '));
+  const out=new Map();
   for(let i=1;i<rows.length;i++){
     const r=rows[i]; if(!r || r.every(c=>!c||!c.toString().trim())) continue;
     const get=k=>colmap[k]!=null?(r[colmap[k]]||'').toString().trim():'';
-    const whD=parseDate(get('wh_received'));
-    const fbD=parseDate(get('fb_inbounded'));
-    if(!whD||!fbD) continue;
-    let bd=get('business_days');
-    bd=bd===''?businessDaysBetween(whD,fbD):Number(bd);
-    if(isNaN(bd)) bd=businessDaysBetween(whD,fbD);
-    let cd=get('calendar_days');
-    cd=cd===''?Math.round((fbD-whD)/86400000):Number(cd);
-    if(isNaN(cd)) cd=Math.round((fbD-whD)/86400000);
-    const qtyRaw=get('qty');
-    const qty=qtyRaw===''?0:Number(qtyRaw)||0;
+    const po=get('po'); if(!po) continue;
+    const whD=parseDate(get('wh_received')); if(!whD) continue;
+    const qtyRaw=get('qty'); const qty=qtyRaw===''?0:Number(qtyRaw)||0;
+    // If duplicate PO in WMS, keep earliest received date
+    const key=po.toLowerCase();
+    const existing=out.get(key);
+    if(!existing || whD<existing._whD){
+      out.set(key,{po,org:get('org')||'Unknown',category:get('category')||'Unknown',qty,_whD:whD,wh_received:fmtDate(whD)});
+    }
+  }
+  return out;
+}
+
+function parseFbRows(rows){
+  if(!rows.length) throw new Error('Firstbase CSV is empty');
+  const colmap=buildColumnMap(rows[0]);
+  const miss=['po','fb_inbounded'].filter(k=>!(k in colmap));
+  if(miss.length) throw new Error('Firstbase file missing columns: '+miss.join(', '));
+  const out=new Map();
+  for(let i=1;i<rows.length;i++){
+    const r=rows[i]; if(!r || r.every(c=>!c||!c.toString().trim())) continue;
+    const get=k=>colmap[k]!=null?(r[colmap[k]]||'').toString().trim():'';
+    const po=get('po'); if(!po) continue;
+    const fbD=parseDate(get('fb_inbounded')); if(!fbD) continue;
+    const key=po.toLowerCase();
+    const existing=out.get(key);
+    // If duplicate PO in FB, keep earliest inbounded date
+    if(!existing || fbD<existing._fbD){
+      const rec={po,_fbD:fbD,fb_inbounded:fmtDate(fbD)};
+      // Allow FB file to also supply org/category/qty if WMS is missing them
+      if(colmap.org!=null) rec.org=get('org');
+      if(colmap.category!=null) rec.category=get('category');
+      if(colmap.qty!=null){const q=get('qty'); rec.qty=q===''?undefined:Number(q)||0;}
+      out.set(key,rec);
+    }
+  }
+  return out;
+}
+
+function matchAndBuild(wmsMap,fbMap){
+  const all_pos=[];
+  let unmatchedWms=0, unmatchedFb=0;
+  wmsMap.forEach((w,key)=>{
+    const f=fbMap.get(key);
+    if(!f){unmatchedWms++;return;}
+    const whD=w._whD, fbD=f._fbD;
+    const bd=businessDaysBetween(whD,fbD);
+    const cd=Math.round((fbD-whD)/86400000);
     all_pos.push({
-      po:get('po'),
-      org:get('org')||'Unknown',
-      category:get('category')||'Unknown',
-      qty,
-      wh_received:fmtDate(whD),
-      fb_inbounded:fmtDate(fbD),
+      po:w.po,
+      org:w.org||f.org||'Unknown',
+      category:w.category||f.category||'Unknown',
+      qty:(w.qty||f.qty||0),
+      wh_received:w.wh_received,
+      fb_inbounded:f.fb_inbounded,
       business_days:bd,
       calendar_days:cd,
       met_slo:bd<=2
     });
-  }
-  if(!all_pos.length) throw new Error('No valid rows parsed from CSV');
+  });
+  fbMap.forEach((f,key)=>{if(!wmsMap.has(key)) unmatchedFb++;});
+  if(!all_pos.length) throw new Error('No POs matched between the two files — check that PO numbers align.');
+  return {all_pos,unmatchedWms,unmatchedFb};
+}
+
+function buildWarehouseDataFromMatched(all_pos){
+  // (legacy helper retained — see buildStats)
+  return buildStats(all_pos);
+}
+
+function buildStats(all_pos){
 
   // Monthly aggregation
   const byMonth={};
@@ -498,17 +553,57 @@ function setUploadStatus(msg,kind){
   el.className='upload-status'+(kind?' '+kind:'');
 }
 
-function handleCsvUpload(ev){
+// Staged uploads per warehouse: { coventry: {wms:Map, fb:Map, wmsName, fbName}, germany: {...} }
+const pendingUploads={coventry:{},germany:{}};
+
+function renderUploadStatus(){
+  const p=pendingUploads[currentWH]||{};
+  const parts=[];
+  if(p.wmsName) parts.push('WMS: '+p.wmsName+' ('+p.wms.size+' rows)');
+  if(p.fbName)  parts.push('FB: '+p.fbName+' ('+p.fb.size+' rows)');
+  if(!parts.length){setUploadStatus('');return;}
+  setUploadStatus(parts.join(' · '),'success');
+}
+
+function tryMatchAndApply(){
+  const p=pendingUploads[currentWH];
+  if(!p || !p.wms || !p.fb) return;
+  try{
+    const {all_pos,unmatchedWms,unmatchedFb}=matchAndBuild(p.wms,p.fb);
+    WAREHOUSES[currentWH]=buildStats(all_pos);
+    const whLabel=currentWH==='coventry'?'Coventry UK':'Germany EU';
+    let msg='Matched '+all_pos.length+' POs for '+whLabel;
+    if(unmatchedWms||unmatchedFb) msg+=' · unmatched: '+unmatchedWms+' WMS / '+unmatchedFb+' FB';
+    setUploadStatus(msg,'success');
+    renderAll();
+  }catch(err){
+    console.error(err);
+    setUploadStatus('Error: '+err.message,'error');
+  }
+}
+
+function handleCsvUpload(ev,kind){
   const file=ev.target.files && ev.target.files[0];
   if(!file) return;
   const reader=new FileReader();
   reader.onload=e=>{
     try{
       const rows=parseCSV(e.target.result);
-      const data=buildWarehouseDataFromRows(rows);
-      WAREHOUSES[currentWH]=data;
-      setUploadStatus('Loaded '+data.all_pos.length+' POs from '+file.name,'success');
-      renderAll();
+      if(!pendingUploads[currentWH]) pendingUploads[currentWH]={};
+      const p=pendingUploads[currentWH];
+      if(kind==='wms'){
+        p.wms=parseWmsRows(rows); p.wmsName=file.name;
+      } else {
+        p.fb=parseFbRows(rows); p.fbName=file.name;
+      }
+      if(p.wms && p.fb){
+        tryMatchAndApply();
+      } else {
+        renderUploadStatus();
+        const need=p.wms?'Firstbase Orders':'WMS Stock Report';
+        const el=document.getElementById('uploadStatus');
+        el.textContent+=' · waiting for '+need;
+      }
     }catch(err){
       console.error(err);
       setUploadStatus('Error: '+err.message,'error');
@@ -520,17 +615,18 @@ function handleCsvUpload(ev){
 }
 
 function resetWarehouseData(){
+  pendingUploads[currentWH]={};
   WAREHOUSES[currentWH]=JSON.parse(JSON.stringify(ORIGINAL_WAREHOUSES[currentWH]));
   setUploadStatus('Reset to original data','success');
   renderAll();
 }
 
-// Update active warehouse name label on tab change
+// Update active warehouse name label on tab change; show any staged uploads for the tab
 const _origSetWarehouse=setWarehouse;
 setWarehouse=function(wh){
   _origSetWarehouse(wh);
   document.getElementById('activeWhName').textContent=wh==='coventry'?'Coventry UK':'Germany EU';
-  setUploadStatus('');
+  renderUploadStatus();
 };
 
 renderAll();
